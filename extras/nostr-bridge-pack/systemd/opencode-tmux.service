@@ -1,0 +1,15 @@
+[Unit]
+Description=OpenCode tmux session
+After=default.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=OPENCODE_TMUX_SESSION=oc
+Environment=OPENCODE_PROJECT_DIR=%h
+Environment=OPENCODE_BRIDGE_ON_START=1
+ExecStart=%h/.local/bin/opencode-tmux --daemon
+ExecStop=/usr/bin/env bash -lc 'tmux has-session -t "${OPENCODE_TMUX_SESSION:-oc}" 2>/dev/null && tmux kill-session -t "${OPENCODE_TMUX_SESSION:-oc}" || true'
+
+[Install]
+WantedBy=default.target

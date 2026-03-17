@@ -4,18 +4,25 @@ set -euo pipefail
 REPO="${REPO:-Pleb5/opencode-fork}"
 REF="${REF:-nostr-bridge-summary}"
 CFG_DIR="${CFG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}"
+BIN_DIR="${BIN_DIR:-${XDG_BIN_HOME:-$HOME/.local/bin}}"
+SYSTEMD_DIR="${SYSTEMD_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user}"
 BASE_URL="https://raw.githubusercontent.com/${REPO}/${REF}"
 
 echo "Installing Nostr bridge pack"
 echo "  repo: ${REPO}"
 echo "  ref:  ${REF}"
 echo "  dir:  ${CFG_DIR}"
+echo "  bin:  ${BIN_DIR}"
 
-mkdir -p "${CFG_DIR}/plugins" "${CFG_DIR}/command" "${CFG_DIR}/skills/nak"
+mkdir -p "${CFG_DIR}/plugins" "${CFG_DIR}/command" "${CFG_DIR}/skills/nak" "${BIN_DIR}" "${SYSTEMD_DIR}"
 
 curl -fsSL "${BASE_URL}/.opencode/plugins/nostr-bridge.ts" -o "${CFG_DIR}/plugins/nostr-bridge.ts"
 curl -fsSL "${BASE_URL}/.opencode/command/nostr.md" -o "${CFG_DIR}/command/nostr.md"
 curl -fsSL "${BASE_URL}/.opencode/skills/nak/SKILL.md" -o "${CFG_DIR}/skills/nak/SKILL.md"
+curl -fsSL "${BASE_URL}/extras/nostr-bridge-pack/bin/opencode-tmux" -o "${BIN_DIR}/opencode-tmux"
+curl -fsSL "${BASE_URL}/extras/nostr-bridge-pack/systemd/opencode-tmux.service" -o "${SYSTEMD_DIR}/opencode-tmux.service"
+curl -fsSL "${BASE_URL}/extras/nostr-bridge-pack/termux/aliases.example.sh" -o "${CFG_DIR}/termux-opencode-aliases.sh"
+chmod +x "${BIN_DIR}/opencode-tmux"
 
 node - "${CFG_DIR}" <<'JS'
 const fs = require("fs")
@@ -54,6 +61,10 @@ Next steps:
 1. Ensure your OpenCode config includes provider allowlist entry: nostr-bridge
 2. Restart OpenCode
 3. Run: opencode providers login --provider nostr-bridge
-4. In TUI run: /nostr on
+4. Run: opencode-tmux
+5. Optional auto-start (disabled by default):
+   systemctl --user daemon-reload
+   systemctl --user enable --now opencode-tmux.service
+6. Termux aliases template: ${CFG_DIR}/termux-opencode-aliases.sh
 
 EOF

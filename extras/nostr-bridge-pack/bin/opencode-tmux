@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SESSION="${OPENCODE_TMUX_SESSION:-oc}"
+DIR="${OPENCODE_PROJECT_DIR:-$PWD}"
+ATTACH=1
+FRESH=0
+BRIDGE="${OPENCODE_BRIDGE_ON_START:-1}"
+DELAY="${OPENCODE_BRIDGE_DELAY:-1}"
+
+usage() {
+  cat <<'EOF'
+Usage: opencode-tmux [project_dir] [--dir <dir>] [--session <name>] [--daemon] [--new]
+
+Options:
+  --dir <dir>       Start OpenCode in this directory
+  --session <name>  tmux session name (default: oc)
+  --daemon          Start session in background and exit
+  --new             Recreate the tmux session
+  -h, --help        Show this help
+
+Environment:
+  OPENCODE_PROJECT_DIR      Default project dir
+  OPENCODE_TMUX_SESSION     Default tmux session name
+  OPENCODE_BRIDGE_ON_START  Send "/nostr on" on new session (1/0, default: 1)
+  OPENCODE_BRIDGE_DELAY     Delay before sending nostr command in seconds (default: 1)
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --daemon)
+      ATTACH=0
+      ;;
+    --new)
+      FRESH=1
+      ;;
+    --session)
+      shift
+      SESSION="${1:-}"
+      if [ -z "$SESSION" ]; then
+        echo "Missing value for --session" >&2
+        exit 1
+      fi
+      ;;
+    --dir)
+      shift
+      DIR="${1:-}"
+      if [ -z "$DIR" ]; then
+        echo "Missing value for --dir" >&2
+        exit 1
+      fi
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      if [ -d "$1" ]; then
+        DIR="$1"
+      else
+        echo "Unknown argument: $1" >&2
+        usage >&2
+        exit 1
+      fi
+      ;;
+  esac
+  shift
+done
+
+if ! command -v tmux >/dev/null 2>&1; then
+  echo "tmux is required" >&2
+  exit 1
+fi
+
+if ! command -v opencode >/dev/null 2>&1; then
+  echo "opencode is required" >&2
+  exit 1
+fi
+
+if [ ! -d "$DIR" ]; then
+  echo "Directory not found: $DIR" >&2
+  exit 1
+fi
+
+if [ "$FRESH" -eq 1 ] && tmux has-session -t "$SESSION" 2>/dev/null; then
+  tmux kill-session -t "$SESSION"
+fi
+
+CREATED=0
+if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+  tmux new-session -d -s "$SESSION" -c "$DIR" "opencode"
+  CREATED=1
+fi
+
+tmux set-option -t "$SESSION" mouse on >/dev/null
+tmux set-option -t "$SESSION" history-limit 200000 >/dev/null
+tmux set-option -t "$SESSION" detach-on-destroy off >/dev/null
+tmux set-window-option -t "$SESSION":0 aggressive-resize on >/dev/null
+
+if [ "$CREATED" -eq 1 ] && [ "$BRIDGE" = "1" ]; then
+  sleep "$DELAY"
+  tmux send-keys -t "$SESSION":0 "/nostr on" C-m
+fi
+
+if [ "$ATTACH" -eq 1 ]; then
+  exec tmux attach -t "$SESSION" -d
+fi
