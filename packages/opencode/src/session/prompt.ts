@@ -1363,8 +1363,8 @@ export namespace SessionPrompt {
     if (input.agent.name !== "plan" && assistantMessage?.info.agent === "plan") {
       const plan = Session.plan(input.session)
       const exists = await Filesystem.exists(plan)
-      if (exists) {
-        const part = await Session.updatePart({
+      if (exists)
+        userMessage.parts.push({
           id: PartID.ascending(),
           messageID: userMessage.info.id,
           sessionID: userMessage.info.sessionID,
@@ -1373,8 +1373,6 @@ export namespace SessionPrompt {
             BUILD_SWITCH + "\n\n" + `A plan file exists at ${plan}. You should execute on the plan defined within it`,
           synthetic: true,
         })
-        userMessage.parts.push(part)
-      }
       return input.messages
     }
 
@@ -1383,7 +1381,7 @@ export namespace SessionPrompt {
       const plan = Session.plan(input.session)
       const exists = await Filesystem.exists(plan)
       if (!exists) await fs.mkdir(path.dirname(plan), { recursive: true })
-      const part = await Session.updatePart({
+      const part = {
         id: PartID.ascending(),
         messageID: userMessage.info.id,
         sessionID: userMessage.info.sessionID,
@@ -1459,7 +1457,7 @@ This is critical - your turn should only end with either asking the user a quest
 NOTE: At any point in time through this workflow you should feel free to ask the user questions or clarifications. Don't make large assumptions about user intent. The goal is to present a well researched plan to the user, and tie any loose ends before implementation begins.
 </system-reminder>`,
         synthetic: true,
-      })
+      } satisfies MessageV2.TextPart
       userMessage.parts.push(part)
       return input.messages
     }

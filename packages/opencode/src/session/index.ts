@@ -330,9 +330,6 @@ export namespace Session {
       share(result.id).catch(() => {
         // Silently ignore sharing errors during session creation
       })
-    Bus.publish(Event.Updated, {
-      info: result,
-    })
     return result
   }
 

@@ -15,6 +15,8 @@ const KIND_RELAYS = 10050
 const KIND_OUTBOX = 10002
 const KEEP = 2000
 const DIR_RELAYS = ["wss://nos.lol", "wss://relay.damus.io", "wss://purplepag.es"]
+const SHARED_KEY = "__opencode_nostr_bridge_shared__"
+const DUP_MS = 3000
 
 type Cfg = {
   enabled: boolean
@@ -66,6 +68,29 @@ type Run = {
     del: number
   }
 }
+
+type Shared = {
+  owner?: string
+  seen: string[]
+  set: Set<string>
+  cmd: Map<string, number>
+}
+
+const shared = (() => {
+  const root = globalThis as typeof globalThis & {
+    [SHARED_KEY]?: Shared
+  }
+  const hit = root[SHARED_KEY]
+  if (hit) return hit
+  const next: Shared = {
+    owner: undefined,
+    seen: [],
+    set: new Set(),
+    cmd: new Map(),
+  }
+  root[SHARED_KEY] = next
+  return next
+})()
 
 const base = (): Cfg => ({
   enabled: false,
@@ -210,6 +235,31 @@ const make = () => ({
   },
 })
 
+const seenGlobal = (id: string) => {
+  if (shared.set.has(id)) return true
+  shared.set.add(id)
+  shared.seen.push(id)
+  if (shared.seen.length > KEEP) {
+    const drop = shared.seen.shift()
+    if (drop) shared.set.delete(drop)
+  }
+  return false
+}
+
+const seenCmd = (key: string) => {
+  const now = Date.now()
+  const at = shared.cmd.get(key)
+  shared.cmd.set(key, now)
+  if (shared.cmd.size > 300) {
+    for (const [item, time] of shared.cmd) {
+      if (now - time < DUP_MS * 4) continue
+      shared.cmd.delete(item)
+    }
+  }
+  if (!at) return false
+  return now - at < DUP_MS
+}
+
 export const NostrBridge: Plugin = async (input) => {
   const home_data = xdgData ?? path.join(os.homedir(), ".local/share")
   const home_state = xdgState ?? path.join(os.homedir(), ".local/state")
@@ -244,9 +294,38 @@ export const NostrBridge: Plugin = async (input) => {
     .catch(base)
 
   const run = new Map<string, Run>()
+  const track = new Set<string>()
+  const pending = new Map<string, ReturnType<typeof setTimeout>>()
+  const hush = () => {
+    for (const timer of pending.values()) {
+      clearTimeout(timer)
+    }
+    pending.clear()
+    run.clear()
+    track.clear()
+  }
   let route_err = ""
   let sub: { close: (reason?: string) => void } | undefined
   let wait: ReturnType<typeof setTimeout> | undefined
+  const node = [Date.now().toString(36), Math.random().toString(36).slice(2, 8)].join("-")
+
+  const own = async () => {
+    if (shared.owner === node) return true
+    if (shared.owner && shared.owner !== node) return false
+    const sid = cfg.session_id
+    if (sid) {
+      const ok = await api()
+        .session.get({ path: { id: sid } })
+        .then((x) => Boolean(x.data?.id))
+        .catch(() => false)
+      if (ok) {
+        shared.owner = node
+        return true
+      }
+    }
+    if (!shared.owner) shared.owner = node
+    return shared.owner === node
+  }
 
   const apiErr = (label: string, val: any) => {
     if (val && typeof val === "object") {
@@ -459,6 +538,16 @@ export const NostrBridge: Plugin = async (input) => {
     state.title = hit
   }
 
+  const label = async (sid?: string) => {
+    if (!sid) return "(none)"
+    const name = await api()
+      .session.get({ path: { id: sid } })
+      .then((x) => x.data?.title)
+      .catch(() => undefined)
+    if (!name) return sid
+    return `${sid} (${name})`
+  }
+
   const start = (sid: string) => {
     const hit = run.get(sid)
     if (hit) return hit
@@ -472,41 +561,49 @@ export const NostrBridge: Plugin = async (input) => {
     return next
   }
 
+  let choosing: Promise<string | undefined> | undefined
   const pick = async () => {
-    if (cfg.session_id) {
-      const res = await api()
-        .session.get({ path: { id: cfg.session_id } })
-        .catch((error) => ({ error }))
-      const ok = Boolean(res?.data?.id)
-      if (ok) return cfg.session_id
-      route_err = apiErr("session.get", res)
-    }
+    if (choosing) return choosing
+    choosing = (async () => {
+      if (cfg.session_id) {
+        const res = await api()
+          .session.get({ path: { id: cfg.session_id } })
+          .catch((error) => ({ error }))
+        const ok = Boolean(res?.data?.id)
+        if (ok) return cfg.session_id
+        route_err = apiErr("session.get", res)
+      }
 
-    const list = await api()
-      .session.list()
-      .catch((error) => ({ error }))
-    const hit = list?.data?.[0]?.id
-    if (hit) {
-      cfg.session_id = hit
+      const list = await api()
+        .session.list()
+        .catch((error) => ({ error }))
+      const hit = list?.data?.[0]?.id
+      if (hit) {
+        cfg.session_id = hit
+        save()
+        route_err = ""
+        return hit
+      }
+      route_err = apiErr("session.list", list)
+
+      const create = await api()
+        .session.create({ body: {} })
+        .catch((error) => ({ error }))
+      const made = create?.data?.id
+      if (!made) {
+        route_err = apiErr("session.create", create)
+        return undefined
+      }
+
+      cfg.session_id = made
+      shared.owner = node
       save()
       route_err = ""
-      return hit
-    }
-    route_err = apiErr("session.list", list)
-
-    const create = await api()
-      .session.create({ body: {} })
-      .catch((error) => ({ error }))
-    const made = create?.data?.id
-    if (!made) {
-      route_err = apiErr("session.create", create)
-      return undefined
-    }
-
-    cfg.session_id = made
-    save()
-    route_err = ""
-    return made
+      return made
+    })().finally(() => {
+      choosing = undefined
+    })
+    return choosing
   }
 
   const active = async () => {
@@ -593,6 +690,150 @@ export const NostrBridge: Plugin = async (input) => {
       variant: undefined,
       mode: undefined,
     }
+  }
+
+  const tok = (val: string) => {
+    const text = val.trim()
+    if (!text) return 0
+    return Math.max(1, Math.round(text.length / 4))
+  }
+
+  const tokData = (url: string) => {
+    if (!url.startsWith("data:")) return tok(url)
+    const idx = url.indexOf(",")
+    if (idx === -1) return tok(url)
+    const body = url.slice(idx + 1)
+    return Math.max(1, Math.round(body.length / 6))
+  }
+
+  const context = async (sid: string) => {
+    const rows = await api()
+      .session.messages({ path: { id: sid }, query: { limit: 200 } })
+      .then((x) => x.data ?? [])
+      .catch(() => [])
+    const sum = {
+      total: 0,
+      text: 0,
+      tool: 0,
+      file: 0,
+      reasoning: 0,
+      synthetic: 0,
+      visible: 0,
+    }
+    const top: { name: string; count: number }[] = []
+    let user = 0
+    let assistant = 0
+    let latest:
+      | {
+          input: number
+          output: number
+          reasoning: number
+          read: number
+          write: number
+          total: number
+        }
+      | undefined
+
+    const add = (name: string, count: number, synthetic = false) => {
+      if (count <= 0) return
+      top.push({ name, count })
+      sum.total += count
+      if (synthetic) sum.synthetic += count
+      if (!synthetic) sum.visible += count
+    }
+
+    for (const row of rows) {
+      const info = obj(row?.info)
+      const id = text(info?.id) ?? "(unknown)"
+      const role = text(info?.role)
+      if (role === "user") user++
+      if (role === "assistant") assistant++
+
+      const tokens = obj(info?.tokens)
+      if (role === "assistant" && tokens) {
+        latest = {
+          input: num(tokens.input),
+          output: num(tokens.output),
+          reasoning: num(tokens.reasoning),
+          read: num(obj(tokens.cache)?.read),
+          write: num(obj(tokens.cache)?.write),
+          total: num(tokens.total),
+        }
+      }
+
+      const parts = Array.isArray(row?.parts) ? row.parts : []
+      for (const part of parts) {
+        const typ = text(obj(part)?.type)
+        if (!typ) continue
+        const pid = text(obj(part)?.id) ?? "part"
+        const synthetic = Boolean(obj(part)?.synthetic)
+
+        if (typ === "text") {
+          if (Boolean(obj(part)?.ignored)) continue
+          const count = tok(text(obj(part)?.text) ?? "")
+          sum.text += count
+          add(`${typ}:${id}:${pid}`, count, synthetic)
+          continue
+        }
+
+        if (typ === "reasoning") {
+          const count = tok(text(obj(part)?.text) ?? "")
+          sum.reasoning += count
+          add(`${typ}:${id}:${pid}`, count, synthetic)
+          continue
+        }
+
+        if (typ === "tool") {
+          const state = obj(obj(part)?.state)
+          if (text(state?.status) !== "completed") continue
+          const name = text(obj(part)?.tool) ?? "tool"
+          const count = tok(text(state?.output) ?? "")
+          sum.tool += count
+          add(`tool:${name}:${id}:${pid}`, count, synthetic)
+
+          const attachments = Array.isArray(state?.attachments) ? state.attachments : []
+          for (const attachment of attachments) {
+            const file = obj(attachment)
+            const mime = text(file?.mime) ?? "file"
+            const url = text(file?.url) ?? ""
+            const next = tokData(url)
+            sum.file += next
+            add(`tool_file:${mime}:${id}:${pid}`, next, synthetic)
+          }
+          continue
+        }
+
+        if (typ !== "file") continue
+        const mime = text(obj(part)?.mime) ?? "file"
+        const url = text(obj(part)?.url) ?? ""
+        const name = text(obj(part)?.filename) ?? mime
+        const count = tok(name) + tokData(url)
+        sum.file += count
+        add(`file:${name}:${id}:${pid}`, count, synthetic)
+      }
+    }
+
+    const biggest = top
+      .toSorted((a, b) => b.count - a.count)
+      .slice(0, 8)
+      .map((item, idx) => `${idx + 1}. ${item.count} tok ${item.name}`)
+
+    return [
+      `session: ${await label(sid)}`,
+      `messages: user=${user} assistant=${assistant} total=${rows.length}`,
+      `context_estimate_tokens: ${sum.total}`,
+      `visible_tokens: ${sum.visible}`,
+      `synthetic_tokens: ${sum.synthetic}`,
+      `text_tokens: ${sum.text}`,
+      `tool_output_tokens: ${sum.tool}`,
+      `file_tokens: ${sum.file}`,
+      `reasoning_tokens: ${sum.reasoning}`,
+      latest
+        ? `latest_step_tokens: input=${latest.input} output=${latest.output} reasoning=${latest.reasoning} cache_read=${latest.read} cache_write=${latest.write} total=${latest.total}`
+        : "latest_step_tokens: (none)",
+      "largest_contributors:",
+      ...(biggest.length > 0 ? biggest : ["(none)"]),
+    ].join("\n")
   }
 
   const info = async (val: string | undefined) => {
@@ -684,11 +925,28 @@ export const NostrBridge: Plugin = async (input) => {
   }
 
   const stop = async (sid: string) => {
+    track.delete(sid)
+    const timeout = pending.get(sid)
+    if (timeout) {
+      clearTimeout(timeout)
+      pending.delete(sid)
+    }
     const state = run.get(sid)
     if (!state) return
     run.delete(sid)
     await title(sid, state)
     await send(report(sid, state))
+  }
+
+  const queueStop = (sid: string) => {
+    if (pending.has(sid)) return
+    pending.set(
+      sid,
+      setTimeout(() => {
+        pending.delete(sid)
+        void stop(sid)
+      }, 900),
+    )
   }
 
   const show = async () => {
@@ -702,7 +960,7 @@ export const NostrBridge: Plugin = async (input) => {
         .get()
         .then((x) => x.data)
         .catch(() => undefined))
-    const sid = cfg.session_id ?? "(none)"
+    const sid = await label(cfg.session_id)
     const hit = cfg.session_id
       ? await recent(cfg.session_id)
       : { model: undefined, variant: undefined, mode: undefined }
@@ -758,6 +1016,7 @@ export const NostrBridge: Plugin = async (input) => {
       "oc status",
       "oc refresh",
       "oc sessions [limit]",
+      "oc context [sessionID]",
       "oc use <sessionID>",
       "oc new [title]",
       "oc mode <build|plan>|clear",
@@ -850,6 +1109,12 @@ export const NostrBridge: Plugin = async (input) => {
       return out.join("\n")
     }
 
+    if (cmd === "context") {
+      const sid = val || cfg.session_id || (await pick())
+      if (!sid) return "no session available"
+      return context(sid)
+    }
+
     if (cmd === "use") {
       if (!val) return "usage: oc use <sessionID>"
       const res = await api()
@@ -863,6 +1128,7 @@ export const NostrBridge: Plugin = async (input) => {
       }
 
       cfg.session_id = val
+      shared.owner = node
       save()
       await prepare(val).catch(() => undefined)
       return `session selected: ${val}`
@@ -880,6 +1146,7 @@ export const NostrBridge: Plugin = async (input) => {
       if (!made) return `failed to create session\n${apiErr("session.create", res)}`
 
       cfg.session_id = made
+      shared.owner = node
       save()
       await prepare(made).catch(() => undefined)
       return `session created: ${made}`
@@ -989,6 +1256,8 @@ export const NostrBridge: Plugin = async (input) => {
   const onmsg = async (evt: Dm) => {
     if (!cfg.enabled) return
     if (evt.kind !== KIND) return
+    if (!(await own())) return
+    if (seenGlobal(evt.id)) return
     if (cfg.seen.includes(evt.id)) return
 
     cfg.seen.push(evt.id)
@@ -1034,8 +1303,15 @@ export const NostrBridge: Plugin = async (input) => {
       return
     }
 
-    const out = await ctl(msg.trim())
+    const body = msg.trim()
+    if (body.toLowerCase().startsWith("oc ") && seenCmd(`${evt.pubkey}:${body}`)) {
+      save()
+      return
+    }
+
+    const out = await ctl(body)
     if (out !== undefined) {
+      hush()
       await send(out)
       save()
       return
@@ -1049,6 +1325,7 @@ export const NostrBridge: Plugin = async (input) => {
     }
 
     cfg.session_id = sid
+    shared.owner = node
     save()
 
     const ready = await prepare(sid)
@@ -1059,7 +1336,8 @@ export const NostrBridge: Plugin = async (input) => {
       return
     }
 
-    await api()
+    track.add(sid)
+    const ok = await api()
       .session.prompt({
         path: { id: sid },
         body: {
@@ -1069,12 +1347,17 @@ export const NostrBridge: Plugin = async (input) => {
           parts: [
             {
               type: "text",
-              text: msg,
+              text: body,
             },
           ],
         },
       })
-      .catch(() => undefined)
+      .then(() => true)
+      .catch(() => false)
+
+    if (!ok) {
+      track.delete(sid)
+    }
 
     save()
   }
@@ -1212,6 +1495,7 @@ export const NostrBridge: Plugin = async (input) => {
       if (evt.type === "tui.session.select") {
         const sid = text(obj(evt.properties)?.sessionID)
         if (!sid) return
+        shared.owner = node
         cfg.session_id = sid
         save()
         void prepare(sid).catch(() => undefined)
@@ -1224,14 +1508,22 @@ export const NostrBridge: Plugin = async (input) => {
         const sid = text(obj(evt.properties)?.sessionID)
         const state = text(obj(obj(evt.properties)?.status)?.type)
         if (!sid || !state) return
+        const active = run.has(sid)
+        if (!active && !track.has(sid)) return
 
         if (state === "busy") {
+          const timeout = pending.get(sid)
+          if (timeout) {
+            clearTimeout(timeout)
+            pending.delete(sid)
+          }
           start(sid)
           return
         }
 
         if (state === "idle") {
-          await stop(sid)
+          if (!active) return
+          queueStop(sid)
         }
         return
       }
@@ -1239,7 +1531,8 @@ export const NostrBridge: Plugin = async (input) => {
       if (evt.type === "session.error") {
         const sid = text(obj(evt.properties)?.sessionID) ?? cfg.session_id
         if (!sid) return
-        const state = start(sid)
+        const state = run.get(sid)
+        if (!state) return
         const err = obj(obj(evt.properties)?.error)
         const name = text(err?.name) ?? "error"
         const msg = text(obj(err?.data)?.message) ?? ""
@@ -1250,7 +1543,8 @@ export const NostrBridge: Plugin = async (input) => {
       if (evt.type === "session.diff") {
         const sid = text(obj(evt.properties)?.sessionID)
         if (!sid) return
-        const state = start(sid)
+        const state = run.get(sid)
+        if (!state) return
         const rows = obj(evt.properties)?.diff
         if (!Array.isArray(rows)) return
         state.diff.files = rows.length
@@ -1341,6 +1635,7 @@ export const NostrBridge: Plugin = async (input) => {
           action: tool.schema
             .enum([
               "status",
+              "context",
               "help",
               "enable",
               "disable",
@@ -1360,6 +1655,11 @@ export const NostrBridge: Plugin = async (input) => {
         },
         async execute(args) {
           if (args.action === "status") return show()
+          if (args.action === "context") {
+            const sid = (args.value ?? "").trim() || cfg.session_id || (await pick())
+            if (!sid) return "no session available"
+            return context(sid)
+          }
           if (args.action === "help") return guide()
 
           if (args.action === "enable") {
@@ -1429,6 +1729,7 @@ export const NostrBridge: Plugin = async (input) => {
               .then((x) => Boolean(x.data?.id))
               .catch(() => false)
             if (!ok) return `session not found: ${sid}`
+            shared.owner = node
             cfg.session_id = sid
             save()
             await prepare(sid).catch(() => undefined)

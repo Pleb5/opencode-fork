@@ -41,18 +41,14 @@ describe("session.started event", () => {
     })
   })
 
-  test("session.started event should be emitted before session.updated", async () => {
+  test("session create should emit one started event", async () => {
     await Instance.provide({
       directory: projectRoot,
       fn: async () => {
-        const events: string[] = []
+        let count = 0
 
         const unsubStarted = Bus.subscribe(Session.Event.Created, () => {
-          events.push("started")
-        })
-
-        const unsubUpdated = Bus.subscribe(Session.Event.Updated, () => {
-          events.push("updated")
+          count++
         })
 
         const session = await Session.create({})
@@ -60,11 +56,7 @@ describe("session.started event", () => {
         await new Promise((resolve) => setTimeout(resolve, 100))
 
         unsubStarted()
-        unsubUpdated()
-
-        expect(events).toContain("started")
-        expect(events).toContain("updated")
-        expect(events.indexOf("started")).toBeLessThan(events.indexOf("updated"))
+        expect(count).toBe(1)
 
         await Session.remove(session.id)
       },

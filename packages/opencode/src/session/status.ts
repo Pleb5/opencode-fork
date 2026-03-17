@@ -60,6 +60,16 @@ export namespace SessionStatus {
   }
 
   export function set(sessionID: SessionID, status: Info) {
+    const current = get(sessionID)
+    const same =
+      current.type === status.type &&
+      (status.type !== "retry" ||
+        (current.type === "retry" &&
+          current.attempt === status.attempt &&
+          current.message === status.message &&
+          current.next === status.next))
+    if (same) return
+
     Bus.publish(Event.Status, {
       sessionID,
       status,
