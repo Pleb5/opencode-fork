@@ -1,0 +1,556 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SESSION="${OPENCODE_TMUX_SESSION:-oc}"
+LAUNCHER="${OPENCODE_TMUX_LAUNCHER:-$HOME/.local/bin/opencode-tmux}"
+CFG_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
+CFG_DIR="${CFG_ROOT}/ocmux-tunnels"
+DEF_FILE="${CFG_DIR}/default"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/opencode/ocmux"
+
+usage() {
+  cat <<'EOF'
+Usage: ocmux <start|attach|stop|status|tunnel> [args]
+
+Commands:
+  start [dir] [--tunnel [profile]] [--tunnel-host <user@host>] [--remote-port <n>] [--jump-port <n>]
+  attach
+  stop
+  status
+  tunnel setup [profile]
+  tunnel start [profile]
+  tunnel stop [profile|--all]
+  tunnel status [profile]
+
+Examples:
+  ocmux start
+  ocmux start ~/Work/opencode --tunnel
+  ocmux start --tunnel work-vps
+  ocmux start --tunnel-host johnd@jump.example.com --remote-port 22022
+  ocmux tunnel setup
+EOF
+}
+
+ensure_dirs() {
+  mkdir -p "$CFG_DIR" "$STATE_DIR"
+}
+
+fail() {
+  echo "ocmux: $*" >&2
+  exit 1
+}
+
+ok() {
+  echo "ocmux: $*"
+}
+
+confirm() {
+  local text="$1"
+  local ans
+  read -r -p "$text [y/N]: " ans
+  [[ "$ans" =~ ^[Yy]$ ]]
+}
+
+prompt() {
+  local text="$1"
+  local def="$2"
+  local out
+  if [ -n "$def" ]; then
+    read -r -p "$text [$def]: " out
+    if [ -z "$out" ]; then
+      echo "$def"
+      return
+    fi
+    echo "$out"
+    return
+  fi
+  read -r -p "$text: " out
+  echo "$out"
+}
+
+expand_home() {
+  local p="$1"
+  if [[ "$p" == "~/"* ]]; then
+    echo "$HOME/${p#~/}"
+    return
+  fi
+  echo "$p"
+}
+
+name_ok() {
+  [[ "$1" =~ ^[a-zA-Z0-9._-]+$ ]]
+}
+
+default_profile() {
+  if [ -f "$DEF_FILE" ]; then
+    tr -d '[:space:]' < "$DEF_FILE"
+    return
+  fi
+  echo "default"
+}
+
+profile_file() {
+  echo "$CFG_DIR/$1.conf"
+}
+
+socket_file() {
+  echo "$STATE_DIR/$1.sock"
+}
+
+write_profile() {
+  local name="$1"
+  local file
+  file="$(profile_file "$name")"
+  {
+    printf 'jump_host=%q\n' "$jump_host"
+    printf 'jump_user=%q\n' "$jump_user"
+    printf 'jump_port=%q\n' "$jump_port"
+    printf 'bind_addr=%q\n' "$bind_addr"
+    printf 'remote_port=%q\n' "$remote_port"
+    printf 'local_host=%q\n' "$local_host"
+    printf 'local_port=%q\n' "$local_port"
+    printf 'key_path=%q\n' "$key_path"
+    printf 'target_user=%q\n' "$target_user"
+  } > "$file"
+  chmod 600 "$file"
+}
+
+load_profile() {
+  local name="$1"
+  local file
+  file="$(profile_file "$name")"
+  [ -f "$file" ] || fail "tunnel profile not found: $name"
+  jump_host=""
+  jump_user=""
+  jump_port="22"
+  bind_addr="127.0.0.1"
+  remote_port="22022"
+  local_host="127.0.0.1"
+  local_port="22"
+  key_path="$HOME/.ssh/ocmux_tunnel_ed25519"
+  target_user="$USER"
+  # shellcheck source=/dev/null
+  source "$file"
+  key_path="$(expand_home "$key_path")"
+  [ -n "$jump_host" ] || fail "profile '$name' is missing jump_host"
+  [ -n "$jump_user" ] || fail "profile '$name' is missing jump_user"
+  [ -n "$remote_port" ] || fail "profile '$name' is missing remote_port"
+}
+
+tunnel_check_profile() {
+  local name="$1"
+  load_profile "$name"
+  local sock
+  local target
+  sock="$(socket_file "$name")"
+  target="$jump_user@$jump_host"
+  local key=()
+  if [ -n "$key_path" ] && [ -f "$key_path" ]; then
+    key=(-i "$key_path")
+  fi
+  if [ ! -S "$sock" ]; then
+    return 1
+  fi
+  ssh -S "$sock" -O check -p "$jump_port" "${key[@]}" "$target" >/dev/null 2>&1
+}
+
+tunnel_stop_profile() {
+  local name="$1"
+  local file
+  file="$(profile_file "$name")"
+  if [ ! -f "$file" ]; then
+    return 0
+  fi
+  load_profile "$name"
+  local sock
+  local target
+  sock="$(socket_file "$name")"
+  target="$jump_user@$jump_host"
+  local key=()
+  if [ -n "$key_path" ] && [ -f "$key_path" ]; then
+    key=(-i "$key_path")
+  fi
+  if [ -S "$sock" ]; then
+    ssh -S "$sock" -O exit -p "$jump_port" "${key[@]}" "$target" >/dev/null 2>&1 || true
+  fi
+  rm -f "$sock"
+}
+
+tunnel_stop_all() {
+  ensure_dirs
+  local file
+  local name
+  for file in "$CFG_DIR"/*.conf; do
+    [ -e "$file" ] || break
+    name="$(basename "$file" .conf)"
+    tunnel_stop_profile "$name"
+  done
+  rm -f "$STATE_DIR"/*.sock >/dev/null 2>&1 || true
+}
+
+tunnel_start_loaded() {
+  local name="$1"
+  local sock
+  local target
+  sock="$(socket_file "$name")"
+  target="$jump_user@$jump_host"
+  local key=()
+  if [ -n "$key_path" ] && [ -f "$key_path" ]; then
+    key=(-i "$key_path")
+  fi
+  ssh -fN \
+    -M \
+    -S "$sock" \
+    -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=3 \
+    -o StrictHostKeyChecking=accept-new \
+    -p "$jump_port" \
+    "${key[@]}" \
+    -R "$bind_addr:$remote_port:$local_host:$local_port" \
+    "$target"
+}
+
+tunnel_start_profile() {
+  local name="$1"
+  load_profile "$name"
+  tunnel_stop_profile "$name"
+  tunnel_start_loaded "$name"
+  ok "tunnel '$name' up ($bind_addr:$remote_port -> $local_host:$local_port via $jump_user@$jump_host)"
+}
+
+tunnel_status_all() {
+  ensure_dirs
+  local file
+  local name
+  local found=0
+  local up=0
+  for file in "$CFG_DIR"/*.conf; do
+    [ -e "$file" ] || break
+    found=1
+    name="$(basename "$file" .conf)"
+    load_profile "$name"
+    if tunnel_check_profile "$name"; then
+      up=$((up + 1))
+      echo "tunnel:$name up  $bind_addr:$remote_port -> $local_host:$local_port via $jump_user@$jump_host"
+    else
+      echo "tunnel:$name down $bind_addr:$remote_port -> $local_host:$local_port via $jump_user@$jump_host"
+    fi
+  done
+  if [ "$found" -eq 0 ]; then
+    echo "tunnel:none configured"
+    return
+  fi
+  echo "tunnel:summary $up up"
+}
+
+tunnel_setup() {
+  ensure_dirs
+  local name="${1:-$(default_profile)}"
+  if ! name_ok "$name"; then
+    fail "invalid profile name '$name' (use letters, digits, ., _, -)"
+  fi
+
+  echo "ocmux tunnel setup wizard"
+  echo
+  echo "This creates a reverse SSH tunnel profile with localhost bind on the jump host."
+  echo
+
+  jump_host="$(prompt "Jump server host" "")"
+  [ -n "$jump_host" ] || fail "jump server host is required"
+
+  jump_user="$(prompt "Jump server user" "$USER")"
+  jump_port="$(prompt "Jump server ssh port" "22")"
+  bind_addr="127.0.0.1"
+  remote_port="$(prompt "Jump server remote port for laptop ssh" "22022")"
+  local_host="127.0.0.1"
+  local_port="$(prompt "Local laptop ssh port" "22")"
+  key_path="$(expand_home "$(prompt "SSH key path for jump login" "~/.ssh/ocmux_tunnel_ed25519")")"
+  target_user="$(prompt "Laptop ssh user for second hop" "$USER")"
+
+  echo
+  echo "Before continuing, confirm these jump server prerequisites:"
+  echo "1) /etc/ssh/sshd_config has: AllowTcpForwarding yes"
+  echo "2) /etc/ssh/sshd_config keeps: GatewayPorts no (or default)"
+  echo "3) sshd restarted after changes"
+  echo "4) jump user '$jump_user' exists and can SSH in"
+  echo
+  if ! confirm "Continue"; then
+    fail "setup cancelled"
+  fi
+
+  mkdir -p "$(dirname "$key_path")"
+  if [ ! -f "$key_path" ]; then
+    ok "generating key at $key_path"
+    ssh-keygen -t ed25519 -N "" -f "$key_path"
+  else
+    ok "using existing key $key_path"
+  fi
+
+  if confirm "Upload public key to jump server now"; then
+    if command -v ssh-copy-id >/dev/null 2>&1; then
+      ssh-copy-id -i "$key_path.pub" -p "$jump_port" "$jump_user@$jump_host"
+    else
+      echo "ssh-copy-id not found, running manual append command"
+      cat "$key_path.pub" | ssh -p "$jump_port" "$jump_user@$jump_host" 'umask 077; mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys'
+    fi
+  else
+    echo
+    echo "Manual key install command:"
+    echo "cat \"$key_path.pub\" | ssh -p $jump_port $jump_user@$jump_host 'umask 077; mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys'"
+    echo
+  fi
+
+  if ssh -i "$key_path" -p "$jump_port" -o BatchMode=yes -o ConnectTimeout=7 "$jump_user@$jump_host" "echo ok" >/dev/null 2>&1; then
+    ok "jump server auth test passed"
+  else
+    echo "ocmux: warning: jump server auth test failed (you can still save and fix later)" >&2
+  fi
+
+  write_profile "$name"
+  echo "$name" > "$DEF_FILE"
+  chmod 600 "$DEF_FILE"
+
+  echo
+  ok "saved tunnel profile '$name'"
+  echo "Phone second-hop example:"
+  echo "ssh -J $jump_user@$jump_host -p $remote_port -t $target_user@localhost \"~/.local/bin/ocmux attach\""
+  echo
+
+  if confirm "Start this tunnel now"; then
+    tunnel_start_profile "$name"
+  fi
+}
+
+tunnel_start_adhoc() {
+  local host="$1"
+  local rport="$2"
+  local jport="$3"
+  local lhost="$4"
+  local lport="$5"
+  local key="$6"
+  local bind="$7"
+  local tuser="$8"
+  local jump="$USER"
+  local srv="$host"
+
+  if [[ "$host" == *@* ]]; then
+    jump="${host%@*}"
+    srv="${host#*@}"
+  fi
+
+  jump_host="$srv"
+  jump_user="$jump"
+  jump_port="$jport"
+  bind_addr="$bind"
+  remote_port="$rport"
+  local_host="$lhost"
+  local_port="$lport"
+  key_path="$(expand_home "$key")"
+  target_user="$tuser"
+
+  write_profile "adhoc"
+  tunnel_start_profile "adhoc"
+}
+
+kill_sessions() {
+  tmux list-sessions -F "#{session_name}" 2>/dev/null | while IFS= read -r name; do
+    case "$name" in
+      oc|oc-*) tmux kill-session -t "$name" || true ;;
+    esac
+  done || true
+}
+
+cmd_start() {
+  shift
+  local dir="$PWD"
+  local tunnel=""
+  local host=""
+  local rport="22022"
+  local jport="22"
+  local lhost="127.0.0.1"
+  local lport="22"
+  local key="$HOME/.ssh/ocmux_tunnel_ed25519"
+  local bind="127.0.0.1"
+  local tuser="$USER"
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --tunnel)
+        if [ "${2:-}" != "" ] && [[ "${2:-}" != --* ]]; then
+          tunnel="$2"
+          shift
+        else
+          tunnel="$(default_profile)"
+        fi
+        ;;
+      --tunnel-host)
+        host="${2:-}"
+        [ -n "$host" ] || fail "--tunnel-host requires a value"
+        shift
+        ;;
+      --remote-port)
+        rport="${2:-}"
+        [ -n "$rport" ] || fail "--remote-port requires a value"
+        shift
+        ;;
+      --jump-port)
+        jport="${2:-}"
+        [ -n "$jport" ] || fail "--jump-port requires a value"
+        shift
+        ;;
+      --local-host)
+        lhost="${2:-}"
+        [ -n "$lhost" ] || fail "--local-host requires a value"
+        shift
+        ;;
+      --local-port)
+        lport="${2:-}"
+        [ -n "$lport" ] || fail "--local-port requires a value"
+        shift
+        ;;
+      --bind-addr)
+        bind="${2:-}"
+        [ -n "$bind" ] || fail "--bind-addr requires a value"
+        shift
+        ;;
+      --key)
+        key="${2:-}"
+        [ -n "$key" ] || fail "--key requires a value"
+        shift
+        ;;
+      --target-user)
+        tuser="${2:-}"
+        [ -n "$tuser" ] || fail "--target-user requires a value"
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        if [ -d "$1" ]; then
+          dir="$1"
+        else
+          fail "unknown start argument: $1"
+        fi
+        ;;
+    esac
+    shift
+  done
+
+  [ -d "$dir" ] || fail "directory not found: $dir"
+
+  kill_sessions
+  tunnel_stop_all
+
+  if [ -n "$host" ] && [ -n "$tunnel" ]; then
+    fail "use either --tunnel-host or --tunnel, not both"
+  fi
+
+  if [ -n "$host" ]; then
+    tunnel_start_adhoc "$host" "$rport" "$jport" "$lhost" "$lport" "$key" "$bind" "$tuser"
+  fi
+
+  if [ -n "$tunnel" ] && [ -z "$host" ]; then
+    tunnel_start_profile "$tunnel"
+  fi
+
+  OPENCODE_PROJECT_DIR="$dir" "$LAUNCHER" --session "$SESSION" --daemon --new
+  exec tmux attach -t "$SESSION" -d
+}
+
+cmd_attach() {
+  exec tmux attach -t "$SESSION" -d
+}
+
+cmd_stop() {
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl --user stop opencode-tmux.service >/dev/null 2>&1 || true
+  fi
+  kill_sessions
+  tunnel_stop_all
+}
+
+cmd_status() {
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl --user status opencode-tmux.service --no-pager || true
+  fi
+  tmux list-sessions 2>/dev/null || true
+  tunnel_status_all
+}
+
+cmd_tunnel() {
+  shift
+  case "${1:-}" in
+    setup)
+      shift
+      tunnel_setup "${1:-}"
+      ;;
+    start)
+      shift
+      tunnel_start_profile "${1:-$(default_profile)}"
+      ;;
+    stop)
+      shift
+      if [ "${1:-}" = "--all" ] || [ -z "${1:-}" ]; then
+        tunnel_stop_all
+      else
+        tunnel_stop_profile "$1"
+      fi
+      ;;
+    status)
+      shift
+      if [ -n "${1:-}" ]; then
+        load_profile "$1"
+        if tunnel_check_profile "$1"; then
+          echo "tunnel:$1 up  $bind_addr:$remote_port -> $local_host:$local_port via $jump_user@$jump_host"
+        else
+          echo "tunnel:$1 down $bind_addr:$remote_port -> $local_host:$local_port via $jump_user@$jump_host"
+        fi
+      else
+        tunnel_status_all
+      fi
+      ;;
+    -h|--help|"")
+      usage
+      ;;
+    *)
+      fail "unknown tunnel command: $1"
+      ;;
+  esac
+}
+
+if ! command -v tmux >/dev/null 2>&1; then
+  fail "tmux is required"
+fi
+
+if [ ! -x "$LAUNCHER" ]; then
+  fail "launcher not found: $LAUNCHER"
+fi
+
+ensure_dirs
+
+case "${1:-}" in
+  start)
+    cmd_start "$@"
+    ;;
+  attach)
+    cmd_attach
+    ;;
+  stop)
+    cmd_stop
+    ;;
+  status)
+    cmd_status
+    ;;
+  tunnel)
+    cmd_tunnel "$@"
+    ;;
+  -h|--help|"")
+    usage
+    ;;
+  *)
+    fail "unknown command: $1"
+    ;;
+esac

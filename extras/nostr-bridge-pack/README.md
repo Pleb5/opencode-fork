@@ -8,6 +8,7 @@ It installs these files into your OpenCode config directory:
 - `command/nostr.md`
 - `skills/nak/SKILL.md`
 - `~/.local/bin/opencode-tmux`
+- `~/.local/bin/ocmux`
 - `~/.config/systemd/user/opencode-tmux.service` (installed, not enabled)
 - `termux-opencode-aliases.sh` template in your OpenCode config dir
 - dependency merge into `package.json`
@@ -45,8 +46,8 @@ If you use `enabled_providers`, include `nostr-bridge`:
 ## First Run
 
 1. Restart OpenCode
-2. `opencode providers login --provider nostr-bridge`
-3. Launch OpenCode in tmux: `opencode-tmux`
+2. `opencode auth login`
+3. Launch OpenCode in tmux: `ocmux start`
 4. Verify bridge status in the TUI with `/nostr status`
 
 The launcher sends `/nostr on` when it creates a fresh tmux session. You can disable this by setting:
@@ -57,9 +58,39 @@ export OPENCODE_BRIDGE_ON_START=0
 
 ## Daily Workflow
 
-- Laptop: run `opencode-tmux`
-- Termux: `ssh -t <user>@<host> "~/.local/bin/opencode-tmux"`
+- Laptop: run `ocmux start`
+- Termux: `ssh -t <user>@<host> "~/.local/bin/ocmux attach"`
 - Handoff is instant because `tmux attach -d` detaches the other client and takes over the same session.
+
+`opencode-tmux` restarts the target session by default before starting. Use `--keep` when you only want to attach without recreating the session.
+
+`ocmux start` and `ocmux stop` also clean up any active reverse tunnel managed by `ocmux`.
+
+## Reverse tunnel workflow
+
+Use localhost bind on the jump server (recommended):
+
+```bash
+ocmux tunnel setup
+```
+
+Then:
+
+```bash
+ocmux start --tunnel
+```
+
+One-off host argument (ad-hoc profile):
+
+```bash
+ocmux start --tunnel-host user@jump.example.com --remote-port 22022
+```
+
+Status includes tunnel state by default:
+
+```bash
+ocmux status
+```
 
 ## Optional systemd user startup
 

@@ -5,6 +5,7 @@ SESSION="${OPENCODE_TMUX_SESSION:-oc}"
 DIR="${OPENCODE_PROJECT_DIR:-$PWD}"
 ATTACH=1
 FRESH=0
+REPLACE="${OPENCODE_TMUX_REPLACE:-1}"
 BRIDGE="${OPENCODE_BRIDGE_ON_START:-1}"
 DELAY="${OPENCODE_BRIDGE_DELAY:-1}"
 
@@ -17,11 +18,13 @@ Options:
   --session <name>  tmux session name (default: oc)
   --daemon          Start session in background and exit
   --new             Recreate the tmux session
+  --keep            Keep existing session instead of restarting it
   -h, --help        Show this help
 
 Environment:
   OPENCODE_PROJECT_DIR      Default project dir
   OPENCODE_TMUX_SESSION     Default tmux session name
+  OPENCODE_TMUX_REPLACE     Restart session before start (1/0, default: 1)
   OPENCODE_BRIDGE_ON_START  Send "/nostr on" on new session (1/0, default: 1)
   OPENCODE_BRIDGE_DELAY     Delay before sending nostr command in seconds (default: 1)
 EOF
@@ -34,6 +37,9 @@ while [ "$#" -gt 0 ]; do
       ;;
     --new)
       FRESH=1
+      ;;
+    --keep)
+      REPLACE=0
       ;;
     --session)
       shift
@@ -83,8 +89,10 @@ if [ ! -d "$DIR" ]; then
   exit 1
 fi
 
-if [ "$FRESH" -eq 1 ] && tmux has-session -t "$SESSION" 2>/dev/null; then
-  tmux kill-session -t "$SESSION"
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+  if [ "$REPLACE" = "1" ] || [ "$FRESH" -eq 1 ]; then
+    tmux kill-session -t "$SESSION" || true
+  fi
 fi
 
 CREATED=0

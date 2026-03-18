@@ -20,9 +20,11 @@ curl -fsSL "${BASE_URL}/.opencode/plugins/nostr-bridge.ts" -o "${CFG_DIR}/plugin
 curl -fsSL "${BASE_URL}/.opencode/command/nostr.md" -o "${CFG_DIR}/command/nostr.md"
 curl -fsSL "${BASE_URL}/.opencode/skills/nak/SKILL.md" -o "${CFG_DIR}/skills/nak/SKILL.md"
 curl -fsSL "${BASE_URL}/extras/nostr-bridge-pack/bin/opencode-tmux" -o "${BIN_DIR}/opencode-tmux"
+curl -fsSL "${BASE_URL}/extras/nostr-bridge-pack/bin/ocmux" -o "${BIN_DIR}/ocmux"
 curl -fsSL "${BASE_URL}/extras/nostr-bridge-pack/systemd/opencode-tmux.service" -o "${SYSTEMD_DIR}/opencode-tmux.service"
 curl -fsSL "${BASE_URL}/extras/nostr-bridge-pack/termux/aliases.example.sh" -o "${CFG_DIR}/termux-opencode-aliases.sh"
 chmod +x "${BIN_DIR}/opencode-tmux"
+chmod +x "${BIN_DIR}/ocmux"
 
 node - "${CFG_DIR}" <<'JS'
 const fs = require("fs")
@@ -60,8 +62,8 @@ Install complete.
 Next steps:
 1. Ensure your OpenCode config includes provider allowlist entry: nostr-bridge
 2. Restart OpenCode
-3. Run: opencode providers login --provider nostr-bridge
-4. Run: opencode-tmux
+3. Run: opencode auth login
+4. Run: ocmux start
 5. Optional auto-start (disabled by default):
    systemctl --user daemon-reload
    systemctl --user enable --now opencode-tmux.service
